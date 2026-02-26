@@ -1,296 +1,261 @@
+import io
 import os
 import json
+import gzip
 import time
-import csv
-from datetime import datetime
+import zipfile
+from datetime import datetime, timedelta
 from pathlib import Path
 
-import requests
 import pandas as pd
+import requests
 
 
-# ----------------------------
-# Config
-# ----------------------------
-API_KEY = os.getenv("TWELVE_API_KEY", "").strip()
-BASE_URL = "https://api.twelvedata.com/time_series"
-
+# -----------------------------
+# Files
+# -----------------------------
 DATA_DIR = Path("data")
 LATEST_PATH = DATA_DIR / "latest.json"
 HISTORY_PATH = DATA_DIR / "history.json"
-
-# EMA windows you use in dashboard logic
-EMA_WINDOWS = [20, 50, 200]
-
-# For daily incremental update, we only need enough candles to compute EMA200
-INCR_CANDLES = 260
-
-# Rate-limit safety: TwelveData free tiers can be strict. Keep it conservative.
-SLEEP_EVERY = 8       # sleep after every N API calls
-SLEEP_SECONDS = 2.0   # how long to sleep
-RETRY_COUNT = 3       # retries per request
-RETRY_SLEEP = 2.0     # base retry sleep
+CLOSES_PATH = DATA_DIR / "closes.csv.gz"   # date,symbol,close
 
 
-# ----------------------------
-# Helpers
-# ----------------------------
-def ensure_data_files():
+# -----------------------------
+# NSE Bhavcopy URLs (Equities)
+# Example:
+# https://archives.nseindia.com/content/historical/EQUITIES/2026/FEB/cm26022026bhav.csv.zip
+# -----------------------------
+BHAV_BASE = "https://archives.nseindia.com/content/historical/EQUITIES"
+
+
+def ensure_storage():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not LATEST_PATH.exists():
         LATEST_PATH.write_text("{}", encoding="utf-8")
     if not HISTORY_PATH.exists():
         HISTORY_PATH.write_text("[]", encoding="utf-8")
+    if not CLOSES_PATH.exists():
+        # create empty gz csv with header
+        df0 = pd.DataFrame(columns=["date", "symbol", "close"])
+        write_closes(df0)
 
 
-def load_symbols_csv(path="nse500_symbols.csv"):
-    """
-    Expect format:
-    symbol
-    RELIANCE
-    TCS
-    ...
-    """
-    symbols = []
-    with open(path, "r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        if "symbol" not in (reader.fieldnames or []):
-            raise RuntimeError("nse500_symbols.csv must have a header column named: symbol")
-        for row in reader:
-            s = (row.get("symbol") or "").strip()
-            if not s:
-                continue
-            # normalize common user inputs
-            s = s.replace("NSE:", "").replace(".NS", "").strip().upper()
-            symbols.append(s)
-
-    # de-dupe while preserving order
-    seen = set()
-    unique = []
-    for s in symbols:
-        if s not in seen:
-            unique.append(s)
-            seen.add(s)
-
-    if len(unique) < 50:
-        raise RuntimeError(f"Need at least 50 symbols in nse500_symbols.csv (found {len(unique)}).")
-
-    return unique
-
-
-def td_request(params):
-    """
-    Robust request with retries + basic error handling.
-    """
-    if not API_KEY:
-        raise RuntimeError("Missing TWELVE_API_KEY secret. Add it in repo Settings → Secrets and variables → Actions.")
-
-    params = dict(params)
-    params["apikey"] = API_KEY
-
-    last_err = None
-    for attempt in range(1, RETRY_COUNT + 1):
-        try:
-            r = requests.get(BASE_URL, params=params, timeout=30)
-            data = r.json()
-
-            # Twelve Data sometimes returns {"status":"error","message":...}
-            if isinstance(data, dict) and data.get("status") == "error":
-                msg = data.get("message", "Unknown Twelve Data error")
-                # Retry on rate limit / transient
-                if "rate" in msg.lower() or "limit" in msg.lower() or "temporarily" in msg.lower():
-                    raise RuntimeError(msg)
-                # Non-retry errors
-                raise RuntimeError(msg)
-
-            return data
-
-        except Exception as e:
-            last_err = e
-            if attempt < RETRY_COUNT:
-                time.sleep(RETRY_SLEEP * attempt)
-                continue
-            raise RuntimeError(f"TwelveData request failed after retries: {last_err}") from last_err
-
-
-def fetch_series(symbol, outputsize, interval="1day"):
-    """
-    Fetch candles; returns DataFrame with columns: datetime, close
-    """
-    data = td_request({
-        "symbol": symbol,
-        "interval": interval,
-        "outputsize": outputsize,
-        "format": "JSON",
-        "order": "ASC",  # oldest -> newest for easier EMA
-    })
-
-    values = data.get("values", [])
-    if not values:
-        # Could be invalid symbol; skip later
-        return pd.DataFrame(columns=["datetime", "close"])
-
-    df = pd.DataFrame(values)
-    # Ensure types
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df["close"] = pd.to_numeric(df["close"], errors="coerce")
-    df = df.dropna(subset=["close"]).sort_values("datetime")
-    return df[["datetime", "close"]]
-
-
-def add_emas(df):
-    """
-    Adds EMA20/50/200 columns to df (expects close column).
-    """
-    out = df.copy()
-    for w in EMA_WINDOWS:
-        out[f"ema{w}"] = out["close"].ewm(span=w, adjust=False).mean()
-    return out
-
-
-def compute_health_for_date(per_symbol_df_map, dt):
-    """
-    Market health = % of symbols whose close > EMA200 on that date.
-    If a symbol doesn't have that date candle, it's skipped.
-    """
-    total = 0
-    above = 0
-
-    for sym, df in per_symbol_df_map.items():
-        row = df[df["datetime"] == dt]
-        if row.empty:
-            continue
-        total += 1
-        close = float(row["close"].iloc[0])
-        ema200 = float(row["ema200"].iloc[0])
-        if close > ema200:
-            above += 1
-
-    if total == 0:
-        return None
-
-    pct = round((above / total) * 100, 2)
-    return {"date": dt.strftime("%Y-%m-%d"), "above200": above, "total": total, "health_pct": pct}
-
-
-def load_history():
+def read_history():
     try:
         return json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
     except Exception:
         return []
 
 
-def save_latest(obj):
-    LATEST_PATH.write_text(json.dumps(obj, indent=2), encoding="utf-8")
-
-
-def save_history(arr):
+def write_history(arr):
     HISTORY_PATH.write_text(json.dumps(arr, indent=2), encoding="utf-8")
 
 
-# ----------------------------
-# Main modes
-# ----------------------------
-def run_incremental(symbols):
-    """
-    Fast path: fetch last ~260 candles per symbol, compute health only for the latest common date,
-    append to history if new.
-    """
-    per_symbol = {}
-    api_calls = 0
+def write_latest(obj):
+    LATEST_PATH.write_text(json.dumps(obj, indent=2), encoding="utf-8")
 
-    for i, sym in enumerate(symbols, start=1):
-        df = fetch_series(sym, outputsize=INCR_CANDLES)
-        api_calls += 1
-        if api_calls % SLEEP_EVERY == 0:
-            time.sleep(SLEEP_SECONDS)
 
-        if df.empty or len(df) < 210:
+def read_closes():
+    if not CLOSES_PATH.exists():
+        return pd.DataFrame(columns=["date", "symbol", "close"])
+    with gzip.open(CLOSES_PATH, "rt", encoding="utf-8") as f:
+        df = pd.read_csv(f)
+    if df.empty:
+        return pd.DataFrame(columns=["date", "symbol", "close"])
+    df["date"] = pd.to_datetime(df["date"])
+    df["symbol"] = df["symbol"].astype(str).str.upper()
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    df = df.dropna(subset=["date", "symbol", "close"])
+    return df
+
+
+def write_closes(df):
+    out = df.copy()
+    if not out.empty:
+        out["date"] = pd.to_datetime(out["date"]).dt.strftime("%Y-%m-%d")
+        out["symbol"] = out["symbol"].astype(str).str.upper()
+    with gzip.open(CLOSES_PATH, "wt", encoding="utf-8") as f:
+        out.to_csv(f, index=False)
+
+
+def load_symbols_csv(path="nse500_symbols.csv"):
+    df = pd.read_csv(path)
+    if "symbol" not in df.columns:
+        raise RuntimeError("nse500_symbols.csv must have a header column named: symbol")
+    syms = (
+        df["symbol"]
+        .astype(str)
+        .str.strip()
+        .str.replace("NSE:", "", regex=False)
+        .str.replace(".NS", "", regex=False)
+        .str.upper()
+        .tolist()
+    )
+    # de-dupe preserve order
+    seen = set()
+    out = []
+    for s in syms:
+        if not s or s == "NAN":
             continue
-        df = add_emas(df)
-        per_symbol[sym] = df
-
-    if not per_symbol:
-        raise RuntimeError("No valid symbol data fetched. Check your symbols or API quota.")
-
-    # Find latest date that exists in most series:
-    # We'll use the max date among all, then compute on that date.
-    latest_dt = max(df["datetime"].max() for df in per_symbol.values())
-    latest = compute_health_for_date(per_symbol, latest_dt)
-    if latest is None:
-        raise RuntimeError("Could not compute health for latest date (no overlapping data).")
-
-    # Update history (append only if new date)
-    hist = load_history()
-    last_date = hist[-1]["date"] if hist else None
-    if last_date != latest["date"]:
-        hist.append(latest)
-        # Keep only last 5 years ~ 1300 trading days (optional)
-        if len(hist) > 1400:
-            hist = hist[-1400:]
-        save_history(hist)
-
-    save_latest(latest)
-    return latest
+        if s not in seen:
+            out.append(s)
+            seen.add(s)
+    if len(out) < 100:
+        raise RuntimeError(f"Too few symbols in nse500_symbols.csv (found {len(out)}).")
+    return out
 
 
-def run_full_backfill(symbols, years=5):
+def bhavcopy_url(dt: datetime) -> str:
+    yyyy = dt.strftime("%Y")
+    mmm = dt.strftime("%b").upper()  # FEB, MAR...
+    ddmmyyyy = dt.strftime("%d%m%Y")
+    return f"{BHAV_BASE}/{yyyy}/{mmm}/cm{ddmmyyyy}bhav.csv.zip"
+
+
+def download_bhavcopy(dt: datetime) -> pd.DataFrame:
     """
-    Heavy path: fetch ~5y daily for each symbol, compute health for each date intersection.
-    This can be slow and API-quota heavy. Use once.
+    Downloads & parses bhavcopy zip for a date.
+    Returns DataFrame with columns: SYMBOL, SERIES, CLOSE, TIMESTAMP
     """
-    per_symbol = {}
-    api_calls = 0
+    url = bhavcopy_url(dt)
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+    }
+    r = requests.get(url, headers=headers, timeout=40)
+    if r.status_code != 200:
+        raise RuntimeError(f"Bhavcopy not available: {url} (status {r.status_code})")
 
-    # Rough trading days for 5y: ~1250
-    outputsize = 1500
+    z = zipfile.ZipFile(io.BytesIO(r.content))
+    # usually one csv inside
+    name = z.namelist()[0]
+    raw = z.read(name)
+    df = pd.read_csv(io.BytesIO(raw))
 
-    for sym in symbols:
-        df = fetch_series(sym, outputsize=outputsize)
-        api_calls += 1
-        if api_calls % SLEEP_EVERY == 0:
-            time.sleep(SLEEP_SECONDS)
+    # Normalize expected columns
+    df.columns = [c.strip().upper() for c in df.columns]
+    for c in ["SYMBOL", "SERIES", "CLOSE", "TIMESTAMP"]:
+        if c not in df.columns:
+            raise RuntimeError(f"Bhavcopy missing column {c}. Columns={df.columns.tolist()}")
 
-        if df.empty or len(df) < 210:
+    # Parse date
+    df["TIMESTAMP"] = pd.to_datetime(df["TIMESTAMP"], errors="coerce")
+    df = df.dropna(subset=["TIMESTAMP"])
+    return df
+
+
+def get_latest_available_bhavcopy(max_lookback_days=10):
+    """
+    Try today, then go back up to N days to find last trading day file.
+    """
+    today = datetime.now()
+    for i in range(max_lookback_days):
+        dt = today - timedelta(days=i)
+        try:
+            df = download_bhavcopy(dt)
+            return dt, df
+        except Exception:
             continue
-        df = add_emas(df)
-        per_symbol[sym] = df
+    raise RuntimeError("Could not find any bhavcopy in last lookback window.")
 
-    if not per_symbol:
-        raise RuntimeError("No valid symbol data fetched for backfill. Check symbols / API limits.")
 
-    # Build a common date set: intersection of dates across symbols (strict) is often too small.
-    # We'll instead use union of dates and compute on each date with available symbols.
-    all_dates = sorted(set(pd.concat([df["datetime"] for df in per_symbol.values()]).unique()))
-    results = []
-    for dt in all_dates:
-        obj = compute_health_for_date(per_symbol, dt)
-        if obj:
-            results.append(obj)
+def compute_ema_flags(closes_df: pd.DataFrame):
+    """
+    closes_df: columns date,symbol,close
+    returns per-symbol latest close, ema200, and flag(close>ema200)
+    """
+    df = closes_df.sort_values(["symbol", "date"]).copy()
 
-    # Keep approx last 5y points
-    if len(results) > 1400:
-        results = results[-1400:]
+    # Compute EMA200 per symbol
+    df["ema200"] = (
+        df.groupby("symbol")["close"]
+        .transform(lambda s: s.ewm(span=200, adjust=False).mean())
+    )
 
-    save_history(results)
-    if results:
-        save_latest(results[-1])
-    return results[-1] if results else {}
+    # Take latest row per symbol
+    latest = df.groupby("symbol").tail(1).copy()
+    latest["above200"] = latest["close"] > latest["ema200"]
+    return latest[["date", "symbol", "close", "ema200", "above200"]]
 
 
 def main():
-    ensure_data_files()
-    symbols = load_symbols_csv()
+    ensure_storage()
+    symbols = load_symbols_csv("nse500_symbols.csv")
 
-    # If you want a full one-time backfill, set this to "1" in workflow env.
-    force_full = os.getenv("FORCE_FULL_BACKFILL", "0").strip() == "1"
+    # 1) Download latest available bhavcopy
+    dt, bhav = get_latest_available_bhavcopy()
+    bhav_date = pd.to_datetime(dt.strftime("%Y-%m-%d"))
 
-    if force_full:
-        latest = run_full_backfill(symbols)
-    else:
-        latest = run_incremental(symbols)
+    # 2) Filter EQ series only and our symbol universe
+    eq = bhav[bhav["SERIES"].astype(str).str.upper() == "EQ"].copy()
+    eq["SYMBOL"] = eq["SYMBOL"].astype(str).str.upper().str.strip()
+    eq = eq[eq["SYMBOL"].isin(symbols)].copy()
+    eq["CLOSE"] = pd.to_numeric(eq["CLOSE"], errors="coerce")
+    eq = eq.dropna(subset=["CLOSE"])
 
-    print("DONE:", latest)
+    if eq.empty:
+        raise RuntimeError("Bhavcopy loaded, but no matching EQ symbols found (check symbol list).")
+
+    # 3) Load stored closes and append latest date if not already present
+    closes = read_closes()
+
+    # If this date already exists, do nothing (avoid duplicates)
+    already = False
+    if not closes.empty:
+        already = (closes["date"].dt.strftime("%Y-%m-%d") == bhav_date.strftime("%Y-%m-%d")).any()
+
+    if not already:
+        new_rows = pd.DataFrame({
+            "date": [bhav_date] * len(eq),
+            "symbol": eq["SYMBOL"].tolist(),
+            "close": eq["CLOSE"].tolist(),
+        })
+        closes = pd.concat([closes, new_rows], ignore_index=True)
+
+        # Keep only last ~5 years trading days (~1400) per symbol
+        closes = closes.sort_values(["symbol", "date"])
+        closes = closes.groupby("symbol").tail(1400).reset_index(drop=True)
+
+        write_closes(closes)
+
+    # 4) Compute Market Health for latest date
+    # Need enough history for EMA200; skip symbols with <210 points
+    counts = closes.groupby("symbol").size()
+    eligible = counts[counts >= 210].index.tolist()
+    closes_eligible = closes[closes["symbol"].isin(eligible)].copy()
+
+    latest_flags = compute_ema_flags(closes_eligible)
+
+    # Use latest date actually present in computed flags
+    latest_date = latest_flags["date"].max()
+    today_slice = latest_flags[latest_flags["date"] == latest_date]
+
+    total = int(today_slice.shape[0])
+    above = int(today_slice["above200"].sum())
+
+    health_pct = round((above / total) * 100, 2) if total else 0.0
+
+    latest_obj = {
+        "date": pd.to_datetime(latest_date).strftime("%Y-%m-%d"),
+        "above200": above,
+        "total": total,
+        "health_pct": health_pct,
+    }
+
+    # 5) Update history (append only if new date)
+    hist = read_history()
+    last_date = hist[-1]["date"] if hist else None
+    if last_date != latest_obj["date"]:
+        hist.append(latest_obj)
+        # Keep last ~5y
+        if len(hist) > 1400:
+            hist = hist[-1400:]
+        write_history(hist)
+
+    write_latest(latest_obj)
+
+    print("DONE", latest_obj)
 
 
 if __name__ == "__main__":
