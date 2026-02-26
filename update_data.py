@@ -187,8 +187,12 @@ def main():
         raise RuntimeError("Missing TWELVE_API_KEY env var. Add it as a GitHub Secret.")
 
     symbols = load_symbols()
-    if len(symbols) < 200:
-        raise RuntimeError(f"Need NSE500 list in nse500_symbols.csv (found {len(symbols)} symbols).")
+    # Remove duplicates
+symbols = list(set(symbols))
+
+# Require at least 480 stocks
+if len(symbols) < 480:
+    raise RuntimeError(f"Need full NSE500 list in nse500_symbols.csv (found {len(symbols)} symbols).")
 
     all_dfs = {}
     # 120 symbols per call is supported in batch mode citeturn0search0turn0search8
