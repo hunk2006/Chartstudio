@@ -1,9 +1,10 @@
 name: Update NSE500 Market Health
 
 on:
-  schedule:
-    - cron: "30 10 * * 1-5"
   workflow_dispatch:
+  schedule:
+    # 19:05 IST Mon-Fri (GitHub uses UTC)
+    - cron: "35 13 * * 1-5"
 
 permissions:
   contents: write
@@ -11,9 +12,9 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -26,8 +27,6 @@ jobs:
           pip install pandas requests
 
       - name: Run updater
-        env:
-          TWELVE_API_KEY: ${{ secrets.TWELVE_API_KEY }}
         run: |
           python update_data.py
 
@@ -35,6 +34,6 @@ jobs:
         run: |
           git config user.name "chartstudio-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add data/latest.json data/history.json
-          git commit -m "Daily update" || echo "No changes"
+          git add data/*.json data/*.gz || true
+          git commit -m "Update market health data" || echo "No changes to commit"
           git push
