@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ChartStudio • NSE 500 Market Health</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <div class="wrap">
+    <header class="top">
+      <div class="brand"><span class="chart">Chart</span><span class="studio">Studio</span></div>
+      <div class="subtitle">NSE 500 • Market Health & “Green Days Coming” Early Warning</div>
+    </header>
+
+    <section class="grid">
+      <div class="card hero">
+        <div class="heroTop">
+          <div class="date" id="dt">—</div>
+          <div class="badge" id="zoneBadge">—</div>
+        </div>
+
+        <div class="pctRow">
+          <div class="pct" id="healthPct">—%</div>
+          <div class="meta">
+            <div class="metaLine"><span class="k">Daily Signal</span> <span class="v" id="dailySignal">—</span></div>
+            <div class="metaLine"><span class="k">Green days in next 5 sessions</span> <span class="v" id="greenProb">—%</span></div>
+            <div class="metaLine"><span class="k">Alert</span> <span class="v" id="greenAlert">—</span></div>
+          </div>
+        </div>
+
+        <div class="headline" id="headline">—</div>
+
+        <div class="slider">
+          <div class="track"></div>
+          <div class="tick t0">0</div><div class="tick t25">25</div><div class="tick t50">50</div><div class="tick t75">75</div><div class="tick t100">100</div>
+          <div class="indicator" id="indicator"><div class="dot"></div></div>
+        </div>
+
+        <div class="mini">
+          <div class="miniItem"><div class="miniK">% > 20 EMA</div><div class="miniV" id="p20">—</div></div>
+          <div class="miniItem"><div class="miniK">% > 50 EMA</div><div class="miniV" id="p50">—</div></div>
+          <div class="miniItem"><div class="miniK">% > 200 EMA</div><div class="miniV" id="p200">—</div></div>
+          <div class="miniItem"><div class="miniK">A/D Ratio</div><div class="miniV" id="ad">—</div></div>
+        </div>
+      </div>
+
+      <div class="card chartCard">
+        <div class="cardTitle">History</div>
+        <canvas id="lineChart" height="160"></canvas>
+        <div class="note">Tip: Refresh this page anytime. Data updates automatically after the daily job runs.</div>
+      </div>
+    </section>
+
+    <footer class="foot">
+      <div class="footItem">
+        <span class="ig"></span><span>@thechartstudio</span>
+      </div>
+      <div class="footItem">
+        <span class="x"></span><span>thechartstudio</span>
+      </div>
+      <div class="footItem">
+        <span class="globe"></span><span>thechartstudio.com</span>
+      </div>
+    </footer>
+  </div>
+
+<script src="app.js"></script>
+</body>
+</html>
