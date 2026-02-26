@@ -10,7 +10,7 @@ import requests
 
 
 # -----------------------------
-# Files
+# Storage files
 # -----------------------------
 DATA_DIR = Path("data")
 LATEST_PATH = DATA_DIR / "latest.json"
@@ -19,13 +19,14 @@ CLOSES_PATH = DATA_DIR / "closes.csv.gz"   # date,symbol,close
 
 
 # -----------------------------
-# NSE Bhavcopy URLs (Equities)
-# Correct filename format:
-# cmDDMMMYYYYbhav.csv.zip  (example: cm26FEB2026bhav.csv.zip)
-# Example:
-# https://archives.nseindia.com/content/historical/EQUITIES/2026/FEB/cm26FEB2026bhav.csv.zip
+# NSE Bhavcopy (Equities) URL bases (fallback order)
+# Correct filename: cmDDMMMYYYYbhav.csv.zip (example: cm26FEB2026bhav.csv.zip)
 # -----------------------------
-BHAV_BASE = "https://archives.nseindia.com/content/historical/EQUITIES"
+BHAV_BASES = [
+    "https://nsearchives.nseindia.com/content/historical/EQUITIES",
+    "https://archives.nseindia.com/content/historical/EQUITIES",
+    "https://www1.nseindia.com/content/historical/EQUITIES",
+]
 
 
 def ensure_storage():
@@ -103,41 +104,54 @@ def load_symbols_csv(path="nse500_symbols.csv"):
     return out
 
 
-def bhavcopy_url(dt: datetime) -> str:
+def bhavcopy_urls(dt: datetime):
     yyyy = dt.strftime("%Y")
-    mmm = dt.strftime("%b").upper()  # FEB, MAR...
-    ddmmmyyyy = dt.strftime("%d%b%Y").upper()  # 26FEB2026
-    return f"{BHAV_BASE}/{yyyy}/{mmm}/cm{ddmmmyyyy}bhav.csv.zip"
+    mmm = dt.strftime("%b").upper()          # FEB
+    ddmmmyyyy = dt.strftime("%d%b%Y").upper() # 26FEB2026
+    fname = f"cm{ddmmmyyyy}bhav.csv.zip"
+    return [f"{base}/{yyyy}/{mmm}/{fname}" for base in BHAV_BASES]
 
 
 def download_bhavcopy(dt: datetime) -> pd.DataFrame:
-    url = bhavcopy_url(dt)
+    urls = bhavcopy_urls(dt)
+
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept": "*/*",
         "Connection": "keep-alive",
         "Referer": "https://www.nseindia.com/",
     }
-    r = requests.get(url, headers=headers, timeout=60)
-    if r.status_code != 200:
-        raise RuntimeError(f"Bhavcopy not available: {url} (status {r.status_code})")
 
-    z = zipfile.ZipFile(io.BytesIO(r.content))
-    name = z.namelist()[0]
-    raw = z.read(name)
-    df = pd.read_csv(io.BytesIO(raw))
+    last_err = None
+    for url in urls:
+        try:
+            r = requests.get(url, headers=headers, timeout=60, allow_redirects=True)
+            if r.status_code != 200:
+                last_err = RuntimeError(f"{url} (status {r.status_code})")
+                continue
 
-    df.columns = [c.strip().upper() for c in df.columns]
-    for c in ["SYMBOL", "SERIES", "CLOSE", "TIMESTAMP"]:
-        if c not in df.columns:
-            raise RuntimeError(f"Bhavcopy missing column {c}. Columns={df.columns.tolist()}")
+            z = zipfile.ZipFile(io.BytesIO(r.content))
+            name = z.namelist()[0]
+            raw = z.read(name)
+            df = pd.read_csv(io.BytesIO(raw))
 
-    df["TIMESTAMP"] = pd.to_datetime(df["TIMESTAMP"], errors="coerce")
-    df = df.dropna(subset=["TIMESTAMP"])
-    return df
+            df.columns = [c.strip().upper() for c in df.columns]
+            for c in ["SYMBOL", "SERIES", "CLOSE", "TIMESTAMP"]:
+                if c not in df.columns:
+                    raise RuntimeError(f"Bhavcopy missing column {c}. Columns={df.columns.tolist()}")
+
+            df["TIMESTAMP"] = pd.to_datetime(df["TIMESTAMP"], errors="coerce")
+            df = df.dropna(subset=["TIMESTAMP"])
+            return df
+
+        except Exception as e:
+            last_err = e
+            continue
+
+    raise RuntimeError(f"Bhavcopy not available on any mirror for {dt.date()}. Last error: {last_err}")
 
 
-def get_latest_available_bhavcopy(max_lookback_days=20):
+def get_latest_available_bhavcopy(max_lookback_days=30):
     today = datetime.now()
     last_err = None
     for i in range(max_lookback_days):
@@ -165,11 +179,11 @@ def main():
     ensure_storage()
     symbols = load_symbols_csv("nse500_symbols.csv")
 
-    # 1) Download latest available bhavcopy (lookback covers weekends/holidays)
-    dt, bhav = get_latest_available_bhavcopy(max_lookback_days=20)
+    # 1) Latest available bhavcopy (covers weekends/holidays)
+    dt, bhav = get_latest_available_bhavcopy(max_lookback_days=30)
     bhav_date = pd.to_datetime(dt.strftime("%Y-%m-%d"))
 
-    # 2) Filter EQ series + our symbol list
+    # 2) Filter EQ + your universe
     bhav["SERIES"] = bhav["SERIES"].astype(str).str.upper()
     bhav["SYMBOL"] = bhav["SYMBOL"].astype(str).str.upper().str.strip()
 
@@ -181,7 +195,7 @@ def main():
     if eq.empty:
         raise RuntimeError("Bhavcopy loaded, but no matching EQ symbols found (check symbol list).")
 
-    # 3) Load stored closes and append latest date if missing
+    # 3) Append closes (store only 5y-ish)
     closes = read_closes()
 
     already = False
@@ -195,19 +209,20 @@ def main():
             "close": eq["CLOSE"].tolist(),
         })
         closes = pd.concat([closes, new_rows], ignore_index=True)
-
-        # Keep only ~5y trading days per symbol
         closes = closes.sort_values(["symbol", "date"])
         closes = closes.groupby("symbol").tail(1400).reset_index(drop=True)
         write_closes(closes)
 
-    # 4) Compute Market Health (close > EMA200)
+    # 4) Market Health = % stocks above EMA200 (needs enough history)
     counts = closes.groupby("symbol").size()
     eligible = counts[counts >= 210].index.tolist()
     closes_eligible = closes[closes["symbol"].isin(eligible)].copy()
 
     if closes_eligible.empty:
-        raise RuntimeError("Not enough history yet to compute EMA200. Need ~210 days of closes. Keep daily runs on.")
+        raise RuntimeError(
+            "Not enough history to compute EMA200 yet. "
+            "Next step is one-time backfill of ~5y history (I can give that script)."
+        )
 
     latest_flags = compute_ema_flags(closes_eligible)
     latest_date = latest_flags["date"].max()
@@ -224,7 +239,7 @@ def main():
         "health_pct": health_pct,
     }
 
-    # 5) Append to history if new date
+    # 5) Update latest + history
     hist = read_history()
     last_date = hist[-1]["date"] if hist else None
     if last_date != latest_obj["date"]:
